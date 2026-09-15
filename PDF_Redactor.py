@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+# python3
 # -*- coding: utf-8 -*-
 
 """
@@ -6,42 +6,42 @@
 PDF IMAGE / TEXT EDITOR
 ============================================================
 
-قابلیت‌ها:
+Features:
 
-1) حذف صفحات با شماره یا بازه
-   مثال:
+1) Delete pages by number or range
+   Example:
        2 5 8-12
 
-2) حذف متن
-   - چند متن مختلف
-   - پیدا کردن تمام occurrence ها
-   - حذف واقعی با PDF Redaction
+2) Delete text
+   - Multiple different text strings
+   - Find all occurrences
+   - Permanent deletion using PDF Redaction
 
-3) جایگزینی متن
-   - ابتدا متن اصلی حذف می‌شود
-   - سپس متن جدید در همان محل قرار می‌گیرد
+3) Replace text
+   - The original text is deleted first
+   - The new text is inserted at the same location
 
-4) حذف تصویر / بخشی از صفحه
-   - عکس مرجع می‌تواند فقط یک crop / screenshot باشد
-   - لازم نیست Image Object مستقل PDF باشد
+4) Delete image / part of a page
+   - The reference image can be only a crop / screenshot
+   - It does not need to be a standalone PDF Image Object
    - SIFT
    - ORB
    - Template Matching
    - Edge Matching
-   - چند occurrence
-   - چند صفحه
+   - Multiple occurrences
+   - Multiple pages
 
-5) حذف تصویر بدون replacement
-   - تشخیص ناحیه
-   - ساخت mask
-   - بازسازی background با OpenCV Inpainting
-   - قرار دادن background بازسازی‌شده روی همان ناحیه
+5) Delete image without replacement
+   - Detect the target region
+   - Create a mask
+   - Reconstruct the background using OpenCV Inpainting
+   - Place the reconstructed background over the same region
 
-6) جایگزینی تصویر
-   - ابتدا ناحیه اصلی بازسازی می‌شود
-   - سپس تصویر جدید دقیقاً در همان ناحیه قرار می‌گیرد
+6) Replace image
+   - First reconstruct the original region
+   - Then insert the new image into the same region
 
-7) صفحات بدون تغییر دست‌نخورده می‌مانند.
+7) Pages without modifications remain unchanged.
 
 ============================================================
 DEPENDENCIES
@@ -179,7 +179,7 @@ def parse_page_ranges(text: str, total_pages: int) -> List[int]:
                         result.add(page_num - 1)
 
             except ValueError:
-                print(f"بازه نامعتبر: {part}")
+                print(f"Invalid range: {part}")
 
         else:
             try:
@@ -189,7 +189,7 @@ def parse_page_ranges(text: str, total_pages: int) -> List[int]:
                     result.add(page_num - 1)
 
             except ValueError:
-                print(f"Pages number incorrect: {part}")
+                print(f"Invalid page number: {part}")
 
     return sorted(result)
 
@@ -207,8 +207,8 @@ def collect_texts() -> List[str]:
     print("TEXTS TO DELETE")
     print("=" * 60)
 
-    print("متن‌هایی که باید حذف شوند را یکی‌یکی وارد کنید.")
-    print("برای پایان، Enter خالی بزنید.")
+    print("Enter the text strings that should be deleted, one at a time.")
+    print("Press Enter on an empty line when you are finished.")
     print()
 
     while True:
@@ -232,8 +232,8 @@ def collect_replacements(texts: List[str]) -> Dict[str, str]:
     print("TEXT REPLACEMENTS")
     print("=" * 60)
 
-    print("برای هر متن، replacement را وارد کنید.")
-    print("اگر فقط حذف می‌خواهید، Enter خالی بزنید.")
+    print("Enter the replacement text for each original text.")
+    print("Press Enter on an empty line if you only want to delete the text.")
     print()
 
     for text in texts:
@@ -2257,11 +2257,11 @@ def main():
 
         print()
         print(
-            "عکس مرجع می‌تواند فقط یک تکه از صفحه باشد."
+            "The reference image can be only a cropped part of the page."
         )
 
         print(
-            "لازم نیست خود PDF آن را به‌عنوان Image Object بشناسد."
+            "It does not need to be recognized as a standalone PDF Image Object."
         )
 
         reference_path = ask_existing_file(
