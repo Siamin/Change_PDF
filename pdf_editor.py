@@ -113,13 +113,16 @@ class PDFEditor:
             self._reset_debug_dir()
         image_report = image_manager.interactively_process(self.debug_dir)
 
-        # 4) Save
+        # 4) Capture final page count BEFORE saving/closing
+        final_page_count = len(self.doc)
+
+        # 5) Save
         self._save()
 
-        # 5) Report
+        # 6) Report
         self._print_report(
             deleted_pages_count,
-            len(self.doc),
+            final_page_count,
             text_report,
             image_report,
         )
@@ -138,7 +141,6 @@ class PDFEditor:
                 deflate=True,
                 clean=True,
             )
-            self.doc.close()
         except Exception as exc:
             print(f"Save error: {exc}")
             try:
@@ -146,6 +148,12 @@ class PDFEditor:
             except Exception:
                 pass
             sys.exit(1)
+
+        # Close after successful save
+        try:
+            self.doc.close()
+        except Exception:
+            pass
 
     def _print_report(
         self,
