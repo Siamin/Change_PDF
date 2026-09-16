@@ -1,9 +1,9 @@
 #python3
 # -*- coding: utf-8 -*-
 """
-Detection + fill box with WHITE color (no sampling).
-Pages without logo copied as-is.
-Pages with logo rebuilt as raster image.
+Detection + fill box with SAMPLED background color.
+Pages without logo are copied as-is.
+Pages with logo become raster images with box filled.
 """
 
 import os
@@ -26,9 +26,6 @@ MIN_AREA_RATIO = 0.0003
 MAX_AREA_RATIO = 0.60
 MAX_PER_PAGE = 10
 
-# رنگ ثابت جایگزین (سفید خالص)
-FILL_RGB = (255, 255, 255)
-
 
 def ask_file(prompt):
     while True:
@@ -44,15 +41,63 @@ def ask_file(prompt):
         print(f"Not found: {p}")
 
 
+# ----------------------------------------------------------------
+# RENDER  (fixed: no BGR->RGB conversion)
+# ----------------------------------------------------------------
 def render_page(page, dpi):
     zoom = dpi / 72.0
     pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom), alpha=False)
     img = np.frombuffer(pix.samples, dtype=np.uint8).reshape(
         pix.height, pix.width, pix.n
-    )
+    ).copy()
     if pix.n == 4:
         return cv2.cvtColor(img, cv2.COLOR_RGBA2RGB)
-    return cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+    # pix.n == 3 : PyMuPDF already gives RGB
+    return img
+
+
+# ----------------------------------------------------------------
+# BACKGROUND COLOR SAMPLING
+# ----------------------------------------------------------------
+def sample_background_rgb(page_rgb, bbox, pad=40):
+    """
+    Sample the dominant background color around the bbox.
+    Uses brightest 60% of pixels (assumes light background).
+    Returns (R, G, B).
+    """
+    x1, y1, x2, y2 = bbox
+    h, w = page_rgb.shape[:2]
+    samples = []
+
+    strips = [
+        (max(0, x1 - pad), max(0, y1 - pad), min(w, x2 + pad), max(1, y1 - 5)),
+        (max(0, x1 - pad), min(h - 1, y2 + 5), min(w, x2 + pad), min(h, y2 + pad)),
+        (max(0, x1 - pad), max(0, y1 - pad), max(1, x1 - 5), min(h, y2 + pad)),
+        (min(w - 1, x2 + 5), max(0, y1 - pad), min(w, x2 + pad), min(h, y2 + pad)),
+    ]
+    for rx1, ry1, rx2, ry2 in strips:
+        if rx2 <= rx1 or ry2 <= ry1:
+            continue
+        region = page_rgb[ry1:ry2, rx1:rx2]
+        if region.size == 0:
+            continue
+        samples.append(region.reshape(-1, 3))
+
+    if not samples:
+        return (255, 255, 255)
+
+    all_px = np.concatenate(samples, axis=0)
+    if all_px.size == 0:
+        return (255, 255, 255)
+
+    brightness = all_px.sum(axis=1)
+    thr = np.percentile(brightness, 40)
+    light = all_px[brightness >= thr]
+    if light.size == 0:
+        light = all_px
+
+    median = np.median(light, axis=0)
+    return tuple(int(np.clip(v, 0, 255)) for v in median)
 
 
 # ----------------------------------------------------------------
@@ -163,7 +208,7 @@ def detect_sift_multiple(page_gray, ref_gray):
 def main():
     print()
     print("=" * 60)
-    print("DETECTION + FILL WHITE + NEW PDF")
+    print("DETECTION + FILL WITH BG COLOR + NEW PDF")
     print("=" * 60)
 
     pdf_path = ask_file("PDF path: ")
@@ -200,9 +245,6 @@ def main():
     total_found = 0
     pages_replaced = 0
 
-    # cv2 rectangle uses BGR
-    fill_bgr = (FILL_RGB[2], FILL_RGB[1], FILL_RGB[0])
-
     for page_index in range(len(src_doc)):
         src_page = src_doc[page_index]
         print(f"\n--- PAGE {page_index + 1} ---")
@@ -210,6 +252,7 @@ def main():
         rect = src_page.rect
         pw, ph = rect.width, rect.height
 
+        # Detect using RENDER_DPI
         page_rgb_detect = render_page(src_page, RENDER_DPI)
         page_gray = cv2.GaussianBlur(
             cv2.cvtColor(page_rgb_detect, cv2.COLOR_RGB2GRAY), (3, 3), 0
@@ -226,12 +269,16 @@ def main():
         total_found += len(bboxes)
         print(f"  detections: {len(bboxes)} -> rasterizing this page")
 
+        # High-DPI render for final image
         page_rgb_final = render_page(src_page, REPLACE_DPI)
         scale = REPLACE_DPI / float(RENDER_DPI)
 
         for i, (x1, y1, x2, y2) in enumerate(bboxes, 1):
-            print(f"  #{i} bbox=({x1},{y1},{x2},{y2})")
+            # Sample BG color around the bbox (in detection image)
+            bg = sample_background_rgb(page_rgb_detect, (x1, y1, x2, y2))
+            print(f"  #{i} bbox=({x1},{y1},{x2},{y2})  BG_RGB={bg}")
 
+            # Scale bbox to final image
             sx1 = int(round(x1 * scale))
             sy1 = int(round(y1 * scale))
             sx2 = int(round(x2 * scale))
@@ -242,15 +289,17 @@ def main():
             sx2 = min(page_rgb_final.shape[1], sx2)
             sy2 = min(page_rgb_final.shape[0], sy2)
 
-            # Fill with WHITE color
+            # cv2 rectangle uses BGR, so flip
+            bg_bgr = (int(bg[2]), int(bg[1]), int(bg[0]))
+
             cv2.rectangle(
                 page_rgb_final,
                 (sx1, sy1),
                 (sx2, sy2),
-                fill_bgr,
+                bg_bgr,
                 -1,
             )
-            print(f"    filled white at ({sx1},{sy1})-({sx2},{sy2})")
+            print(f"    filled with RGB{bg} at ({sx1},{sy1})-({sx2},{sy2})")
 
         dbg_path = os.path.join(debug_dir, f"page_{page_index+1:04d}.png")
         cv2.imwrite(
@@ -259,6 +308,7 @@ def main():
         )
         print(f"  debug saved: {dbg_path}")
 
+        # Encode and place as new page
         bgr = cv2.cvtColor(page_rgb_final, cv2.COLOR_RGB2BGR)
         ok, encoded = cv2.imencode(
             ".jpg", bgr, [cv2.IMWRITE_JPEG_QUALITY, 92]
