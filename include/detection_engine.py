@@ -3,55 +3,106 @@ import math
 import cv2
 import numpy as np
 
-from .constants import (
-    SIFT_RATIO, SIFT_MIN_MATCHES, SIFT_MIN_INLIERS,
-    ORB_RATIO, ORB_MIN_MATCHES, ORB_MIN_INLIERS,
-    TEMPLATE_MIN_SCORE, TEMPLATE_STRONG_SCORE,
-    EDGE_MIN_SCORE, EDGE_STRONG_SCORE,
-    MAX_DETECTIONS_PER_METHOD, MAX_FINAL_DETECTIONS,
-    IOU_MERGE_THRESHOLD, OVERLAP_SMALLER_THRESHOLD,
-    FINAL_DUPLICATE_IOU, MIN_DETECTION_SIZE,
-    TEMPLATE_SCALES,
-    MIN_QUAD_AREA_RATIO, MAX_QUAD_AREA_RATIO,
-    MIN_QUAD_EDGE, MAX_ASPECT_RATIO,
-)
 from .bbox_utils import BBoxUtils
 
 
 class DetectionEngine:
+    """
+    Conservative SIFT-only detector with strong validation.
 
-    # ---------- SIFT / ORB ----------
-    def _feature_loop(self, page_gray, ref_gray, method):
-        detections = []
+    Why SIFT-only?
+        SIFT is robust to rotation, scale, brightness, and JPEG noise.
+        Template/Edge matching produce too many false positives on
+        pages with repeating patterns (numbers, table cells, etc.).
+
+    Strong validation:
+        1. Minimum inliers (matches verified by homography).
+        2. Aspect ratio must be close to reference aspect ratio.
+        3. Detected area must be in a reasonable range.
+        4. Max 5 detections per page.
+        5. Minimum SIFT keypoints on reference (avoid degenerate refs).
+    """
+
+    # ----- Tunable thresholds -----
+    SIFT_RATIO = 0.70
+    MIN_INLIERS = 12
+    MIN_MATCHES = 15
+    RANSAC_THRESHOLD = 3.0
+
+    # Aspect-ratio tolerance: detected/reference must be within ±35%
+    ASPECT_RATIO_TOLERANCE = 0.35
+
+    # Size limits relative to page area
+    MIN_AREA_RATIO = 0.0005
+    MAX_AREA_RATIO = 0.50
+
+    # Per-page limits
+    MAX_DETECTIONS_PER_PAGE = 5
+
+    # Minimum keypoints required on reference image
+    MIN_REF_KEYPOINTS = 20
+
+    def __init__(self):
+        self.report = {}
+
+    # --------------------------------------------------------
+    # Public: main entry
+    # --------------------------------------------------------
+    def detect_on_page(self, page_rgb, ref_gray):
+        """
+        Returns a list of detections for one page.
+        Each detection:
+            {
+                "bbox": (x1, y1, x2, y2),
+                "methods": ["SIFT"],
+                "score": inliers / matches,
+                "verification": aspect_ratio_match (0..1),
+                "inliers": int,
+                "matches": int,
+            }
+        """
+        page_gray = cv2.cvtColor(page_rgb, cv2.COLOR_RGB2GRAY)
+        page_h, page_w = page_gray.shape[:2]
+
+        detections = self._sift_detect(page_gray, ref_gray, page_w, page_h)
+
+        # Apply hard limits
+        detections = detections[: self.MAX_DETECTIONS_PER_PAGE]
+
+        return detections
+
+    # --------------------------------------------------------
+    # SIFT detection
+    # --------------------------------------------------------
+    def _sift_detect(self, page_gray, ref_gray, page_w, page_h):
+        results = []
+
         try:
-            page_h, page_w = page_gray.shape[:2]
-            ref_h, ref_w = ref_gray.shape[:2]
-            if ref_h < 10 or ref_w < 10:
-                return detections
+            # --- Reference keypoints ---
+            sift = cv2.SIFT_create(nfeatures=4000)
+            kp_ref, des_ref = sift.detectAndCompute(ref_gray, None)
 
-            if method == "SIFT":
-                detector = cv2.SIFT_create(nfeatures=5000)
-                ratio, min_matches, min_inliers = (
-                    SIFT_RATIO, SIFT_MIN_MATCHES, SIFT_MIN_INLIERS
+            if des_ref is None or len(kp_ref) < self.MIN_REF_KEYPOINTS:
+                print(
+                    f"      Reference too small: "
+                    f"{0 if kp_ref is None else len(kp_ref)} keypoints "
+                    f"(need >= {self.MIN_REF_KEYPOINTS})"
                 )
-                norm, ransac_t = cv2.NORM_L2, 5.0
-            else:
-                detector = cv2.ORB_create(
-                    nfeatures=8000, scaleFactor=1.2, nlevels=8
-                )
-                ratio, min_matches, min_inliers = (
-                    ORB_RATIO, ORB_MIN_MATCHES, ORB_MIN_INLIERS
-                )
-                norm, ransac_t = cv2.NORM_HAMMING, 6.0
+                return results
 
-            kp_ref, des_ref = detector.detectAndCompute(ref_gray, None)
-            kp_page, des_page = detector.detectAndCompute(page_gray, None)
-            if des_ref is None or des_page is None:
-                return detections
-            if len(kp_ref) < 4 or len(kp_page) < 4:
-                return detections
+            print(f"      Reference keypoints: {len(kp_ref)}")
 
-            matcher = cv2.BFMatcher(norm)
+            # --- Page keypoints ---
+            kp_page, des_page = sift.detectAndCompute(page_gray, None)
+
+            if des_page is None or len(kp_page) < 4:
+                print("      Page has no keypoints.")
+                return results
+
+            print(f"      Page keypoints: {len(kp_page)}")
+
+            # --- Match ---
+            matcher = cv2.BFMatcher(cv2.NORM_L2)
             raw = matcher.knnMatch(des_ref, des_page, k=2)
 
             good = []
@@ -59,44 +110,81 @@ class DetectionEngine:
                 if len(pair) < 2:
                     continue
                 m, n = pair
-                if m.distance < ratio * n.distance:
+                if m.distance < self.SIFT_RATIO * n.distance:
                     good.append(m)
 
-            if len(good) < min_matches:
-                return detections
+            if len(good) < self.MIN_MATCHES:
+                print(
+                    f"      Not enough good matches: "
+                    f"{len(good)} < {self.MIN_MATCHES}"
+                )
+                return results
 
+            print(f"      Good matches: {len(good)}")
+
+            # --- Aspect ratio of reference ---
+            ref_h, ref_w = ref_gray.shape[:2]
+            ref_aspect = ref_w / float(ref_h) if ref_h > 0 else 1.0
+
+            # --- Iterative homography to find multiple instances ---
             active = good[:]
-            max_iter = min(
-                MAX_DETECTIONS_PER_METHOD,
-                max(1, len(active) // max(min_inliers, 1)),
-            )
+            iteration = 0
 
-            for _ in range(max_iter):
-                if len(active) < min_matches:
+            while iteration < self.MAX_DETECTIONS_PER_PAGE:
+                iteration += 1
+
+                if len(active) < self.MIN_MATCHES:
                     break
 
                 src = np.float32([
                     kp_ref[m.queryIdx].pt for m in active
                 ]).reshape(-1, 1, 2)
+
                 dst = np.float32([
                     kp_page[m.trainIdx].pt for m in active
                 ]).reshape(-1, 1, 2)
 
                 try:
-                    H, mask = cv2.findHomography(src, dst, cv2.RANSAC, ransac_t)
+                    H, mask = cv2.findHomography(
+                        src, dst,
+                        cv2.RANSAC,
+                        self.RANSAC_THRESHOLD,
+                    )
                 except Exception:
                     break
+
                 if H is None or mask is None:
                     break
 
                 inlier_mask = mask.ravel().astype(bool)
                 inliers = int(inlier_mask.sum())
-                if inliers < min_inliers:
+
+                if inliers < self.MIN_INLIERS:
+                    print(
+                        f"      Iteration {iteration}: "
+                        f"inliers {inliers} < {self.MIN_INLIERS}, stop"
+                    )
                     break
 
-                bbox = self._bbox_from_homography(
-                    H, ref_gray.shape, page_w, page_h
-                )
+                # --- Compute quad corners in page coords ---
+                corners = np.float32([
+                    [0, 0],
+                    [ref_w - 1, 0],
+                    [ref_w - 1, ref_h - 1],
+                    [0, ref_h - 1],
+                ]).reshape(-1, 1, 2)
+
+                transformed = cv2.perspectiveTransform(corners, H)
+                pts = transformed.reshape(-1, 2)
+
+                if not np.isfinite(pts).all():
+                    active = [
+                        m for i, m in enumerate(active)
+                        if not inlier_mask[i]
+                    ]
+                    continue
+
+                bbox = BBoxUtils.from_points(pts, page_w, page_h)
                 if bbox is None:
                     active = [
                         m for i, m in enumerate(active)
@@ -104,330 +192,131 @@ class DetectionEngine:
                     ]
                     continue
 
+                x1, y1, x2, y2 = bbox
+                bw = x2 - x1
+                bh = y2 - y1
+
+                if bw < 15 or bh < 15:
+                    active = [
+                        m for i, m in enumerate(active)
+                        if not inlier_mask[i]
+                    ]
+                    continue
+
+                # --- Area check ---
+                area = bw * bh
+                page_area = page_w * page_h
+                area_ratio = area / page_area
+
+                if area_ratio < self.MIN_AREA_RATIO:
+                    print(
+                        f"      Reject: area too small "
+                        f"({area_ratio:.5f})"
+                    )
+                    active = [
+                        m for i, m in enumerate(active)
+                        if not inlier_mask[i]
+                    ]
+                    continue
+
+                if area_ratio > self.MAX_AREA_RATIO:
+                    print(
+                        f"      Reject: area too big "
+                        f"({area_ratio:.3f})"
+                    )
+                    active = [
+                        m for i, m in enumerate(active)
+                        if not inlier_mask[i]
+                    ]
+                    continue
+
+                # --- Aspect ratio check ---
+                det_aspect = bw / float(bh)
+                aspect_diff = abs(det_aspect - ref_aspect) / ref_aspect
+
+                if aspect_diff > self.ASPECT_RATIO_TOLERANCE:
+                    print(
+                        f"      Reject: aspect mismatch "
+                        f"(det={det_aspect:.2f} ref={ref_aspect:.2f} "
+                        f"diff={aspect_diff:.0%})"
+                    )
+                    active = [
+                        m for i, m in enumerate(active)
+                        if not inlier_mask[i]
+                    ]
+                    continue
+
+                # --- Verify with template matching ---
+                verify_score = self._verify(page_gray, ref_gray, bbox)
+
+                # Accept if verification >= 0.25 OR inliers very high
+                if verify_score < 0.25 and inliers < 25:
+                    print(
+                        f"      Reject: weak verification "
+                        f"({verify_score:.2f}), inliers={inliers}"
+                    )
+                    active = [
+                        m for i, m in enumerate(active)
+                        if not inlier_mask[i]
+                    ]
+                    continue
+
                 score = inliers / float(max(1, len(active)))
-                detections.append({
+
+                print(
+                    f"      ACCEPT: inliers={inliers} "
+                    f"matches={len(active)} "
+                    f"bbox={bbox} "
+                    f"verify={verify_score:.2f}"
+                )
+
+                results.append({
                     "bbox": bbox,
-                    "method": method,
+                    "methods": ["SIFT"],
                     "score": float(score),
-                    "matches": len(active),
+                    "verification": float(verify_score),
                     "inliers": inliers,
-                    "homography": H,
+                    "matches": len(active),
                 })
 
+                # Remove inliers of this instance
                 active = [
                     m for i, m in enumerate(active)
                     if not inlier_mask[i]
                 ]
-                if len(detections) >= MAX_DETECTIONS_PER_METHOD:
-                    break
 
         except Exception as exc:
-            print(f"  [{method}] error: {exc}")
-        return detections[:MAX_DETECTIONS_PER_METHOD]
+            print(f"  [SIFT] error: {exc}")
 
-    def _validate_quad(self, transformed, page_w, page_h):
-        try:
-            pts = transformed.reshape(-1, 2).astype(np.float32)
-            if len(pts) != 4 or not np.isfinite(pts).all():
-                return False
+        return results
 
-            x_min, x_max = float(pts[:, 0].min()), float(pts[:, 0].max())
-            y_min, y_max = float(pts[:, 1].min()), float(pts[:, 1].max())
-
-            if x_max - x_min < MIN_QUAD_EDGE:
-                return False
-            if y_max - y_min < MIN_QUAD_EDGE:
-                return False
-
-            area = abs(float(cv2.contourArea(pts.reshape(-1, 1, 2))))
-            page_area = float(page_w * page_h)
-            if page_area <= 0:
-                return False
-            ratio = area / page_area
-            if ratio < MIN_QUAD_AREA_RATIO or ratio > MAX_QUAD_AREA_RATIO:
-                return False
-
-            rw = max(x_max - x_min, 1.0)
-            rh = max(y_max - y_min, 1.0)
-            return max(rw / rh, rh / rw) <= MAX_ASPECT_RATIO
-        except Exception:
-            return False
-
-    def _bbox_from_homography(self, H, ref_shape, page_w, page_h):
-        try:
-            rh, rw = ref_shape[:2]
-            corners = np.float32([
-                [0, 0], [rw - 1, 0], [rw - 1, rh - 1], [0, rh - 1],
-            ]).reshape(-1, 1, 2)
-            transformed = cv2.perspectiveTransform(corners, H)
-            if not self._validate_quad(transformed, page_w, page_h):
-                return None
-            return BBoxUtils.from_points(
-                transformed.reshape(-1, 2), page_w, page_h
-            )
-        except Exception:
-            return None
-
-    # ---------- Template / Edge ----------
-    def _resize(self, image, scale):
-        try:
-            h, w = image.shape[:2]
-            tw, th = int(round(w * scale)), int(round(h * scale))
-            if tw < 8 or th < 8:
-                return None
-            interp = cv2.INTER_AREA if scale < 1.0 else cv2.INTER_CUBIC
-            return cv2.resize(image, (tw, th), interpolation=interp)
-        except Exception:
-            return None
-
-    def _local_maxima(self, result, threshold, sw, sh):
-        locs = []
-        try:
-            work = result.copy()
-            if work.size == 0:
-                return locs
-            sw = max(8, sw)
-            sh = max(8, sh)
-            for _ in range(MAX_DETECTIONS_PER_METHOD):
-                _, mv, _, ml = cv2.minMaxLoc(work)
-                if mv < threshold:
-                    break
-                x, y = ml
-                locs.append((x, y, float(mv)))
-                x1, y1 = max(0, x - sw), max(0, y - sh)
-                x2 = min(work.shape[1], x + sw + 1)
-                y2 = min(work.shape[0], y + sh + 1)
-                work[y1:y2, x1:x2] = -1.0
-        except Exception:
-            pass
-        return locs
-
-    def _template_match(self, page_gray, ref_gray, is_edge=False):
-        detections = []
-        page_h, page_w = page_gray.shape[:2]
-        threshold = EDGE_MIN_SCORE if is_edge else TEMPLATE_MIN_SCORE
-        method_name = "EDGE" if is_edge else "TEMPLATE"
-
-        for scale in TEMPLATE_SCALES:
-            template = self._resize(ref_gray, float(scale))
-            if template is None:
-                continue
-            th, tw = template.shape[:2]
-            if tw >= page_w or th >= page_h:
-                continue
-
-            try:
-                result = cv2.matchTemplate(
-                    page_gray, template, cv2.TM_CCOEFF_NORMED
-                )
-                locs = self._local_maxima(
-                    result, threshold, tw // 2, th // 2
-                )
-                for x, y, score in locs:
-                    bbox = BBoxUtils.clip(
-                        (x, y, x + tw, y + th), page_w, page_h
-                    )
-                    if bbox is None:
-                        continue
-                    detections.append({
-                        "bbox": bbox,
-                        "method": method_name,
-                        "score": float(score),
-                        "scale": float(scale),
-                        "matches": 0,
-                        "inliers": 0,
-                    })
-            except Exception:
-                continue
-
-        detections.sort(key=lambda d: d["score"], reverse=True)
-        final = []
-        for d in detections:
-            if any(
-                BBoxUtils.iou(d["bbox"], e["bbox"]) >= FINAL_DUPLICATE_IOU
-                for e in final
-            ):
-                continue
-            final.append(d)
-            if len(final) >= MAX_DETECTIONS_PER_METHOD:
-                break
-        return final
-
-    # ---------- Verification ----------
-    def _verify(self, page_gray, ref_gray, bbox):
+    # --------------------------------------------------------
+    # Template verification (only used to CONFIRM, never to find)
+    # --------------------------------------------------------
+    @staticmethod
+    def _verify(page_gray, ref_gray, bbox):
         try:
             x1, y1, x2, y2 = bbox
             crop = page_gray[y1:y2, x1:x2]
             if crop.size == 0:
                 return 0.0
+
             target = cv2.resize(
-                ref_gray, (crop.shape[1], crop.shape[0]),
+                ref_gray,
+                (crop.shape[1], crop.shape[0]),
                 interpolation=cv2.INTER_AREA,
             )
-            result = cv2.matchTemplate(crop, target, cv2.TM_CCOEFF_NORMED)
+
+            # Normalize both to reduce lighting differences
+            crop_n = cv2.equalizeHist(crop)
+            target_n = cv2.equalizeHist(target)
+
+            result = cv2.matchTemplate(
+                crop_n, target_n, cv2.TM_CCOEFF_NORMED
+            )
             if result.size == 0:
                 return 0.0
             score = float(result[0, 0])
             return score if math.isfinite(score) else 0.0
         except Exception:
             return 0.0
-
-    def _accept(self, group):
-        methods = {d.get("method") for d in group}
-
-        for d in group:
-            if (d.get("method") == "SIFT"
-                    and d.get("inliers", 0) >= SIFT_MIN_INLIERS
-                    and d.get("score", 0.0) >= 0.30):
-                return True, "SIFT"
-        for d in group:
-            if (d.get("method") == "ORB"
-                    and d.get("inliers", 0) >= ORB_MIN_INLIERS
-                    and d.get("score", 0.0) >= 0.30):
-                return True, "ORB"
-        if len(methods) >= 2:
-            return True, "MULTI"
-        if any(d.get("method") == "TEMPLATE"
-               and d.get("score", 0.0) >= TEMPLATE_STRONG_SCORE
-               for d in group):
-            return True, "TEMPLATE"
-        if any(d.get("method") == "EDGE"
-               and d.get("score", 0.0) >= EDGE_STRONG_SCORE
-               for d in group):
-            return True, "EDGE"
-        return False, ""
-
-    def _merge(self, detections, page_gray, ref_gray):
-        if not detections:
-            return []
-
-        priority = {"SIFT": 3, "ORB": 2, "TEMPLATE": 1, "EDGE": 1}
-        detections = sorted(
-            detections,
-            key=lambda d: (
-                d.get("score", 0.0),
-                priority.get(d.get("method"), 0),
-                d.get("inliers", 0),
-            ),
-            reverse=True,
-        )
-
-        groups = []
-        for det in detections:
-            bbox = det["bbox"]
-            found = None
-            for g in groups:
-                if any(
-                    BBoxUtils.iou(bbox, e["bbox"]) >= IOU_MERGE_THRESHOLD
-                    or BBoxUtils.overlap_smaller(bbox, e["bbox"])
-                    >= OVERLAP_SMALLER_THRESHOLD
-                    for e in g
-                ):
-                    found = g
-                    break
-            if found is None:
-                groups.append([det])
-            else:
-                found.append(det)
-
-        final = []
-        for g in groups:
-            ok, reason = self._accept(g)
-            if not ok:
-                continue
-
-            x1 = min(d["bbox"][0] for d in g)
-            y1 = min(d["bbox"][1] for d in g)
-            x2 = max(d["bbox"][2] for d in g)
-            y2 = max(d["bbox"][3] for d in g)
-            bbox = BBoxUtils.clip(
-                (x1, y1, x2, y2),
-                page_gray.shape[1], page_gray.shape[0],
-            )
-            if bbox is None:
-                continue
-            if (bbox[2] - bbox[0] < MIN_DETECTION_SIZE
-                    or bbox[3] - bbox[1] < MIN_DETECTION_SIZE):
-                continue
-
-            verification = self._verify(page_gray, ref_gray, bbox)
-            has_feature = any(
-                (d.get("method") == "SIFT"
-                 and d.get("inliers", 0) >= SIFT_MIN_INLIERS
-                 and d.get("score", 0.0) >= 0.30)
-                or (d.get("method") == "ORB"
-                    and d.get("inliers", 0) >= ORB_MIN_INLIERS
-                    and d.get("score", 0.0) >= 0.30)
-                for d in g
-            )
-            has_direct = any(
-                (d.get("method") == "TEMPLATE"
-                 and d.get("score", 0.0) >= TEMPLATE_STRONG_SCORE)
-                or (d.get("method") == "EDGE"
-                    and d.get("score", 0.0) >= EDGE_STRONG_SCORE)
-                for d in g
-            )
-            if (verification < 0.20 and not has_feature and not has_direct):
-                continue
-
-            best = max(g, key=lambda d: (d.get("inliers", 0), d.get("score", 0.0)))
-            methods = sorted({d.get("method", "?") for d in g})
-
-            final.append({
-                "bbox": bbox,
-                "methods": methods,
-                "score": float(best.get("score", 0.0)),
-                "verification": float(verification),
-                "inliers": int(best.get("inliers", 0)),
-                "acceptance": reason,
-                "group": g,
-            })
-            if len(final) >= MAX_FINAL_DETECTIONS:
-                break
-
-        final.sort(
-            key=lambda d: (
-                d.get("inliers", 0),
-                d.get("score", 0.0),
-                d.get("verification", 0.0),
-            ),
-            reverse=True,
-        )
-
-        dedup = []
-        for d in final:
-            if any(
-                BBoxUtils.iou(d["bbox"], e["bbox"]) >= FINAL_DUPLICATE_IOU
-                for e in dedup
-            ):
-                continue
-            dedup.append(d)
-            if len(dedup) >= MAX_FINAL_DETECTIONS:
-                break
-        return dedup
-
-    # ---------- Public ----------
-    def detect_on_page(self, page_rgb, ref_gray):
-        page_gray = cv2.cvtColor(page_rgb, cv2.COLOR_RGB2GRAY)
-        page_blur = cv2.GaussianBlur(page_gray, (3, 3), 0)
-
-        print("    SIFT...")
-        sift = self._feature_loop(page_gray, ref_gray, "SIFT")
-        print(f"      {len(sift)} candidate(s)")
-
-        print("    ORB...")
-        orb = self._feature_loop(page_gray, ref_gray, "ORB")
-        print(f"      {len(orb)} candidate(s)")
-
-        print("    Template...")
-        tpl = self._template_match(page_blur, ref_gray, is_edge=False)
-        print(f"      {len(tpl)} candidate(s)")
-
-        print("    Edge...")
-        ref_edges = cv2.Canny(ref_gray, 50, 150)
-        page_edges = cv2.Canny(page_gray, 50, 150)
-        edge = self._template_match(page_edges, ref_edges, is_edge=True)
-        print(f"      {len(edge)} candidate(s)")
-
-        all_det = sift + orb + tpl + edge
-        return self._merge(all_det, page_gray, ref_gray)
