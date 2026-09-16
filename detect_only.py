@@ -289,14 +289,11 @@ def main():
             sx2 = min(page_rgb_final.shape[1], sx2)
             sy2 = min(page_rgb_final.shape[0], sy2)
 
-            # cv2 rectangle uses BGR, so flip
-            bg_bgr = (int(bg[2]), int(bg[1]), int(bg[0]))
-
             cv2.rectangle(
                 page_rgb_final,
                 (sx1, sy1),
                 (sx2, sy2),
-                bg_bgr,
+                bg,
                 -1,
             )
             print(f"    filled with RGB{bg} at ({sx1},{sy1})-({sx2},{sy2})")
