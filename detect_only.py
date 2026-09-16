@@ -1,9 +1,8 @@
 #python3
 # -*- coding: utf-8 -*-
 """
-Detection + fill box with SAMPLED background color.
-Pages without logo are copied as-is.
-Pages with logo become raster images with box filled.
+Detection + fill box with sampled BG color.
+No backup. Debug folder is deleted at the end.
 """
 
 import os
@@ -42,7 +41,7 @@ def ask_file(prompt):
 
 
 # ----------------------------------------------------------------
-# RENDER  (fixed: no BGR->RGB conversion)
+# RENDER  (no BGR->RGB conversion)
 # ----------------------------------------------------------------
 def render_page(page, dpi):
     zoom = dpi / 72.0
@@ -52,7 +51,6 @@ def render_page(page, dpi):
     ).copy()
     if pix.n == 4:
         return cv2.cvtColor(img, cv2.COLOR_RGBA2RGB)
-    # pix.n == 3 : PyMuPDF already gives RGB
     return img
 
 
@@ -60,11 +58,6 @@ def render_page(page, dpi):
 # BACKGROUND COLOR SAMPLING
 # ----------------------------------------------------------------
 def sample_background_rgb(page_rgb, bbox, pad=40):
-    """
-    Sample the dominant background color around the bbox.
-    Uses brightest 60% of pixels (assumes light background).
-    Returns (R, G, B).
-    """
     x1, y1, x2, y2 = bbox
     h, w = page_rgb.shape[:2]
     samples = []
@@ -226,14 +219,7 @@ def main():
 
     base, _ = os.path.splitext(pdf_path)
     out_pdf = base + "_edited.pdf"
-    backup_pdf = base + "_backup.pdf"
     debug_dir = base + "_fill_debug"
-
-    try:
-        shutil.copy2(pdf_path, backup_pdf)
-        print(f"Backup created: {backup_pdf}")
-    except Exception as e:
-        print(f"Backup failed: {e}")
 
     os.makedirs(debug_dir, exist_ok=True)
 
@@ -252,7 +238,6 @@ def main():
         rect = src_page.rect
         pw, ph = rect.width, rect.height
 
-        # Detect using RENDER_DPI
         page_rgb_detect = render_page(src_page, RENDER_DPI)
         page_gray = cv2.GaussianBlur(
             cv2.cvtColor(page_rgb_detect, cv2.COLOR_RGB2GRAY), (3, 3), 0
@@ -269,16 +254,13 @@ def main():
         total_found += len(bboxes)
         print(f"  detections: {len(bboxes)} -> rasterizing this page")
 
-        # High-DPI render for final image
         page_rgb_final = render_page(src_page, REPLACE_DPI)
         scale = REPLACE_DPI / float(RENDER_DPI)
 
         for i, (x1, y1, x2, y2) in enumerate(bboxes, 1):
-            # Sample BG color around the bbox (in detection image)
             bg = sample_background_rgb(page_rgb_detect, (x1, y1, x2, y2))
             print(f"  #{i} bbox=({x1},{y1},{x2},{y2})  BG_RGB={bg}")
 
-            # Scale bbox to final image
             sx1 = int(round(x1 * scale))
             sy1 = int(round(y1 * scale))
             sx2 = int(round(x2 * scale))
@@ -289,6 +271,7 @@ def main():
             sx2 = min(page_rgb_final.shape[1], sx2)
             sy2 = min(page_rgb_final.shape[0], sy2)
 
+            # page_rgb_final is RGB -> pass RGB directly
             cv2.rectangle(
                 page_rgb_final,
                 (sx1, sy1),
@@ -296,8 +279,9 @@ def main():
                 bg,
                 -1,
             )
-            print(f"    filled with RGB{bg} at ({sx1},{sy1})-({sx2},{sy2})")
+            print(f"    filled RGB{bg} at ({sx1},{sy1})-({sx2},{sy2})")
 
+        # Save debug image (will be deleted at the end)
         dbg_path = os.path.join(debug_dir, f"page_{page_index+1:04d}.png")
         cv2.imwrite(
             dbg_path,
@@ -305,7 +289,6 @@ def main():
         )
         print(f"  debug saved: {dbg_path}")
 
-        # Encode and place as new page
         bgr = cv2.cvtColor(page_rgb_final, cv2.COLOR_RGB2BGR)
         ok, encoded = cv2.imencode(
             ".jpg", bgr, [cv2.IMWRITE_JPEG_QUALITY, 92]
@@ -333,13 +316,19 @@ def main():
     out_doc.close()
     src_doc.close()
 
+    # ---- Delete debug folder ----
+    try:
+        if os.path.isdir(debug_dir):
+            shutil.rmtree(debug_dir)
+            print(f"Debug folder deleted: {debug_dir}")
+    except Exception as e:
+        print(f"Could not delete debug folder: {e}")
+
     print()
     print("=" * 60)
     print(f"TOTAL DETECTIONS: {total_found}")
     print(f"PAGES REPLACED:   {pages_replaced}")
     print(f"Output PDF:       {out_pdf}")
-    print(f"Backup PDF:       {backup_pdf}")
-    print(f"Debug images:     {debug_dir}")
     print("=" * 60)
 
 
