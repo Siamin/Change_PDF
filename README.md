@@ -296,6 +296,25 @@ pdf-editor/
 │   └── replacement.png
 │
 └── .venv/
+
+PDF
+ ├── Delete Pages
+ ├── Delete / Replace Text
+ │    └── PDF Redaction
+ │
+ └── Delete / Replace Image / Logo
+      ├── SIFT
+      ├── ORB
+      ├── Multi-scale Template Matching
+      ├── Edge Matching
+      ├── RANSAC + Homography
+      ├── Candidate Verification
+      ├── IoU / Overlap Merge
+      ├── PDF Image Object Check
+      ├── Vector Drawing Check
+      ├── TELEA / NS Inpainting
+      ├── Seamless Clone
+      └── Optional Replacement Image
 ```
 
 The Python filename can be different.
